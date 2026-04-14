@@ -143,7 +143,13 @@ Ao receber um briefing do usuario, execute NESTA ORDEM:
 
 
 def main():
-    client = Anthropic()
+    # Research Preview features (multi-agent, memory, outcomes) precisam
+    # de um header beta adicional alem do padrao do SDK.
+    client = Anthropic(
+        default_headers={
+            "anthropic-beta": "managed-agents-2026-04-01,managed-agents-2026-04-01-research-preview",
+        },
+    )
 
     print("=" * 60)
     print("ETAPA 5: Multi-Agent Orchestrator - Content Factory")
@@ -249,6 +255,10 @@ def main():
         # - Todos compartilham o mesmo container/filesystem
         # - Cada sub-agente roda em sua propria THREAD com contexto isolado
         print("\n[2/5] Criando Orchestrator com callable_agents...")
+        # NOTA: callable_agents e Research Preview e pode nao estar tipado no SDK.
+        # Usamos extra_body para enviar parametros que o SDK ainda nao tem tipados.
+        # extra_body e mergeado com o body do request, permitindo acessar
+        # features beta/preview antes do SDK adicionar suporte oficial.
         orchestrator = client.beta.agents.create(
             name="Content Director - Orchestrator",
             model="claude-sonnet-4-6",
@@ -266,24 +276,28 @@ def main():
                     ],
                 },
             ],
-            # AQUI: declarar os sub-agentes que podem ser chamados
-            callable_agents=[
-                {
-                    "type": "agent",
-                    "id": research_agent.id,
-                    "version": research_agent.version,
-                },
-                {
-                    "type": "agent",
-                    "id": writer_agent.id,
-                    "version": writer_agent.version,
-                },
-                {
-                    "type": "agent",
-                    "id": adapter_agent.id,
-                    "version": adapter_agent.version,
-                },
-            ],
+            # AQUI: declarar os sub-agentes que podem ser chamados.
+            # Usando extra_body porque callable_agents e Research Preview
+            # e pode nao ter tipagem no SDK ainda.
+            extra_body={
+                "callable_agents": [
+                    {
+                        "type": "agent",
+                        "id": research_agent.id,
+                        "version": research_agent.version,
+                    },
+                    {
+                        "type": "agent",
+                        "id": writer_agent.id,
+                        "version": writer_agent.version,
+                    },
+                    {
+                        "type": "agent",
+                        "id": adapter_agent.id,
+                        "version": adapter_agent.version,
+                    },
+                ],
+            },
         )
         print(f"    Orchestrator:   {orchestrator.id} (v{orchestrator.version})")
         print(
