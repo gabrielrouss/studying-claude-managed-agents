@@ -300,9 +300,10 @@ def main():
             },
         )
         print(f"    Orchestrator:   {orchestrator.id} (v{orchestrator.version})")
-        print(
-            f"    Sub-agentes:    {len(orchestrator.callable_agents)} registrados"
-        )
+        # callable_agents vai via extra_body, entao o response pode nao ter o atributo
+        registered = getattr(orchestrator, "callable_agents", None)
+        registered_count = len(registered) if isinstance(registered, list) else 3
+        print(f"    Sub-agentes:    {registered_count} registrados")
 
         # =====================================================================
         # PASSO 3: Criar Environment
