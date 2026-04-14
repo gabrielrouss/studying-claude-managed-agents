@@ -190,7 +190,7 @@ def run_agent_and_read_output(client, session_id, message, agent_label, output_p
 
     Retorna o conteudo do arquivo (para passar ao proximo agente).
     """
-    text, tools = run_agent(client, session_id, message, agent_label)
+    _text, tools = run_agent(client, session_id, message, agent_label)
     print(f"    [{agent_label}] Concluido! ({tools} tool calls)")
 
     # Ler o arquivo que o agente escreveu
@@ -413,7 +413,7 @@ def main():
             "Cada canal deve ter conteudo DIFERENTE e NATIVO da plataforma."
         )
 
-        adapter_text, adapter_tools = run_agent(
+        _adapter_text, adapter_tools = run_agent(
             client,
             adapter_session.id,
             adapter_message,
@@ -476,15 +476,15 @@ def main():
             try:
                 client.beta.agents.archive(agent_obj.id)
                 print(f"  ✓ Agent {agent_obj.name} arquivado")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  ⚠ Agent {agent_obj.name}: {e}")
 
         if environment:
             try:
                 client.beta.environments.delete(environment.id)
-                print(f"  ✓ Environment deletado")
-            except Exception:
-                pass
+                print("  ✓ Environment deletado")
+            except Exception as e:
+                print(f"  ⚠ Environment: {e}")
 
         print("  --- CLEANUP COMPLETO ---")
 
