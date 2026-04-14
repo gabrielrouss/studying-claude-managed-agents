@@ -37,8 +37,8 @@ def find_agent_by_name(client: Anthropic, name: str):
     NOTA: A API lista agents paginados. Em producao com muitos agents,
     voce deveria armazenar IDs em um banco de dados em vez de buscar por nome.
     """
-    agents = client.beta.agents.list()
-    for agent in agents.data:
+    # Iterar o objeto paginado diretamente (nao .data) para percorrer todas as paginas
+    for agent in client.beta.agents.list():
         if agent.name == name and agent.archived_at is None:
             return agent
     return None
@@ -73,8 +73,8 @@ def find_environment_by_name(client: Anthropic, name: str):
 
     Environments devem ter nome unico na organizacao/workspace.
     """
-    environments = client.beta.environments.list()
-    for env in environments.data:
+    # Iterar o objeto paginado diretamente (nao .data) para percorrer todas as paginas
+    for env in client.beta.environments.list():
         if env.name == name and env.archived_at is None:
             return env
     return None
@@ -225,18 +225,20 @@ def cleanup_all(client: Anthropic, agents: list = None, environments: list = Non
 def list_all_agents(client: Anthropic):
     """Lista todos os agents da organizacao."""
     print("\n--- AGENTS ---")
-    agents = client.beta.agents.list()
-    for agent in agents.data:
+    count = 0
+    for agent in client.beta.agents.list():
         status = "ARCHIVED" if agent.archived_at else "ACTIVE"
         print(f"  [{status}] {agent.name} ({agent.id}, v{agent.version})")
-    print(f"  Total: {len(agents.data)}")
+        count += 1
+    print(f"  Total: {count}")
 
 
 def list_all_environments(client: Anthropic):
     """Lista todos os environments da organizacao."""
     print("\n--- ENVIRONMENTS ---")
-    envs = client.beta.environments.list()
-    for env in envs.data:
+    count = 0
+    for env in client.beta.environments.list():
         status = "ARCHIVED" if env.archived_at else "ACTIVE"
         print(f"  [{status}] {env.name} ({env.id})")
-    print(f"  Total: {len(envs.data)}")
+        count += 1
+    print(f"  Total: {count}")

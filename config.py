@@ -143,7 +143,19 @@ WRITER_TOOLS = [
     },
 ]
 
-ADAPTER_TOOLS = WRITER_TOOLS  # Mesmas tools que o writer
+ADAPTER_TOOLS = [
+    {
+        "type": "agent_toolset_20260401",
+        "default_config": {"enabled": False},
+        "configs": [
+            {"name": "read", "enabled": True},
+            {"name": "write", "enabled": True},
+            {"name": "edit", "enabled": True},
+            {"name": "bash", "enabled": True},
+            {"name": "glob", "enabled": True},
+        ],
+    },
+]
 
 ORCHESTRATOR_TOOLS = [
     {
