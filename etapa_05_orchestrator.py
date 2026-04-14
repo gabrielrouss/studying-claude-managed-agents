@@ -422,7 +422,50 @@ def main():
         print(f"\n  🎯 Adapter concluido! ({adapter_tools} tool calls)")
 
         # -----------------------------------------------------------------
-        # RESULTADO FINAL
+        # FASE 4: COLETAR RESULTADOS DOS CANAIS
+        # -----------------------------------------------------------------
+        # Os arquivos existem no container cloud do Adapter Agent.
+        # Precisamos pedir ao agente para ler e retornar o conteudo
+        # antes que a session termine e o container seja destruido.
+        print("\n" + "=" * 70)
+        print("  FASE 4: COLETANDO RESULTADOS")
+        print("=" * 70)
+
+        channels = {}
+        for channel in ["linkedin", "instagram", "twitter", "email"]:
+            content, _ = run_agent(
+                client,
+                adapter_session.id,
+                f"Leia o arquivo /workspace/channels/{channel}.md e retorne "
+                f"o conteudo completo, sem comentarios adicionais.",
+                "DOWNLOAD",
+            )
+            channels[channel] = content
+            print(f"  ✓ {channel}.md coletado ({len(content)} chars)")
+
+        # -----------------------------------------------------------------
+        # FASE 5: SALVAR LOCALMENTE + EXIBIR
+        # -----------------------------------------------------------------
+        import os
+
+        output_dir = os.path.join(os.path.dirname(__file__) or ".", "output")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Salvar pesquisa e artigo
+        with open(os.path.join(output_dir, "research.md"), "w", encoding="utf-8") as f:
+            f.write(research_output)
+        with open(os.path.join(output_dir, "artigo.md"), "w", encoding="utf-8") as f:
+            f.write(article_output)
+
+        # Salvar canais
+        for channel, content in channels.items():
+            with open(os.path.join(output_dir, f"{channel}.md"), "w", encoding="utf-8") as f:
+                f.write(content)
+
+        print(f"\n  📁 Todos os arquivos salvos em: {os.path.abspath(output_dir)}/")
+
+        # -----------------------------------------------------------------
+        # EXIBIR RESULTADO FINAL
         # -----------------------------------------------------------------
         print("\n" + "=" * 70)
         print("  PIPELINE COMPLETO - RESULTADO FINAL")
@@ -463,6 +506,29 @@ def main():
   O codigo Python orquestrou o pipeline passando o output
   de cada agente como input para o proximo.
 """)
+
+        # Exibir preview de cada canal
+        print("=" * 70)
+        print("  PREVIEW DOS CONTEUDOS GERADOS")
+        print("=" * 70)
+
+        for channel, content in channels.items():
+            label = {
+                "linkedin": "LINKEDIN",
+                "instagram": "INSTAGRAM",
+                "twitter": "TWITTER/X",
+                "email": "EMAIL",
+            }.get(channel, channel.upper())
+            print(f"\n  --- {label} ({len(content)} chars) ---")
+            # Mostrar primeiras 500 chars como preview
+            preview = content[:500]
+            if len(content) > 500:
+                preview += "\n  [... truncado, veja arquivo completo em output/]"
+            for line in preview.split("\n"):
+                print(f"  {line}")
+
+        print(f"\n  📁 Arquivos completos em: {os.path.abspath(output_dir)}/")
+        print("=" * 70)
 
     finally:
         # =================================================================
