@@ -1,36 +1,43 @@
 """
-Etapa 5: Multi-Agent Orchestrator - Content Factory
-=====================================================
+Etapa 5: Multi-Agent Orchestrator - Content Factory (Orquestracao Real)
+========================================================================
 
 CONCEITOS APRENDIDOS:
-- Multi-Agent: um agente coordenador delega para sub-agentes
-- callable_agents: como declarar quais agentes podem ser chamados
-- Threads: cada sub-agente roda em sua propria thread isolada
-- Eventos multi-agent: thread_created, thread_message_sent/received, thread_idle
-- Container compartilhado: todos os agentes compartilham o mesmo filesystem
-- try/finally para cleanup: evitar vazamento de recursos em caso de erro
+- Orquestracao via codigo: o Python coordena o pipeline entre agentes
+- Sessoes independentes: cada agente roda em sua propria session
+- Filesystem compartilhado: mesmo environment = mesmos arquivos no container
+- Pipeline real: Research -> Writer -> Adapter, cada um fazendo seu trabalho
 
-NOVIDADES EM RELACAO AS ETAPAS ANTERIORES:
-- NAO simulamos mais dados - o pipeline e END-TO-END
-- O Orchestrator decide quando e como delegar
-- Cada sub-agente tem sua propria thread com contexto isolado
-- O stream da session mostra atividade de todas as threads
+COMO FUNCIONA:
+- Criamos UM environment compartilhado
+- Criamos UMA session para cada agente (compartilhando o environment)
+- O codigo Python faz o papel do orchestrator:
+  1. Envia briefing ao Research Agent -> espera terminar
+  2. Envia instrucao ao Writer Agent -> espera terminar
+  3. Envia instrucao ao Adapter Agent -> espera terminar
+  4. Coleta e exibe os resultados
 
-NOTA: Multi-Agent e um Research Preview feature.
-Pode necessitar de acesso adicional.
+NOTA IMPORTANTE:
+  Sessions que compartilham o mesmo environment NAO compartilham filesystem
+  automaticamente (cada session tem container isolado). Para resolver isso,
+  usamos UMA UNICA SESSION reutilizada em sequencia, trocando o agente
+  por mensagem contextual. Alternativamente, poderiamos usar a API de Files
+  para transferir arquivos entre sessions.
+
+  A abordagem aqui usa sessions separadas onde cada agente recebe o contexto
+  necessario via mensagem (o output do agente anterior e passado como input
+  para o proximo).
 
 REQUISITOS:
 - export ANTHROPIC_API_KEY="sua-chave-aqui"
 - pip install anthropic>=0.92.0
-- Acesso ao Research Preview de multi-agent (solicitar em claude.com/form/claude-managed-agents)
 """
 
 from anthropic import Anthropic
 
 # =============================================================================
-# SYSTEM PROMPTS DOS SUB-AGENTES
+# SYSTEM PROMPTS
 # =============================================================================
-# Os mesmos das etapas anteriores, agora centralizados aqui.
 
 RESEARCH_SYSTEM_PROMPT = """\
 Voce e um Research Analyst especializado em marketing digital.
@@ -42,7 +49,6 @@ Voce pesquisa temas na web e gera relatorios estruturados.
 1. Pesquise na web por informacoes atuais sobre o tema solicitado
 2. Busque dados de multiplas fontes
 3. Organize em relatorio estruturado
-4. Salve em /workspace/research/
 
 ## Formato do relatorio
 Markdown com: resumo executivo, pontos-chave, dados/estatisticas, fontes,
@@ -53,6 +59,7 @@ insights para criacao de conteudo.
 - Foque em dados atuais (2024-2026)
 - Portugues brasileiro
 - Seja objetivo e factual
+- Salve o relatorio em /workspace/research/research.md
 """
 
 WRITER_SYSTEM_PROMPT = """\
@@ -62,7 +69,7 @@ Voce e um Copywriter Senior de marketing de conteudo.
 Voce transforma pesquisas em artigos envolventes. NAO pesquisa, apenas escreve.
 
 ## Como trabalhar
-1. Leia o material em /workspace/research/
+1. Leia o material de pesquisa fornecido na mensagem
 2. Escreva artigo de blog completo (800-1200 palavras)
 3. Salve em /workspace/content/artigo.md
 
@@ -78,7 +85,7 @@ ADAPTER_SYSTEM_PROMPT = """\
 Voce e um Social Media Specialist que adapta conteudo para multiplos canais.
 
 ## Seu papel
-Leia o artigo em /workspace/content/artigo.md e adapte para 4 canais.
+Receba um artigo e adapte para 4 canais diferentes.
 
 ## Canais e Regras
 
@@ -100,82 +107,125 @@ Subject line (50 chars), preview text (90 chars), corpo 300-500 palavras, PS bon
 - Nao repita texto entre canais
 """
 
+
 # =============================================================================
-# SYSTEM PROMPT DO ORCHESTRATOR
+# HELPER: Enviar mensagem e coletar resposta completa do agente
 # =============================================================================
-# Este e o agente COORDENADOR. Ele NAO faz o trabalho - ele DELEGA.
-# O system prompt instrui a ORDEM da delegacao e o que esperar de cada agente.
-ORCHESTRATOR_SYSTEM_PROMPT = """\
-Voce e o Content Director, lider de uma equipe de agentes de marketing.
 
-## Sua equipe
-Voce coordena 3 agentes especializados:
-1. **Research Agent**: pesquisa temas na web e salva em /workspace/research/
-2. **Writer Agent**: le pesquisa e escreve artigos em /workspace/content/
-3. **Adapter Agent**: le artigos e adapta para canais em /workspace/channels/
+def run_agent(client, session_id, message, agent_label):
+    """
+    Envia mensagem para um agente e coleta a resposta completa.
 
-## Fluxo de trabalho
-Ao receber um briefing do usuario, execute NESTA ORDEM:
+    Retorna:
+    - full_text: todo o texto que o agente respondeu
+    - tool_count: quantas tools o agente usou
+    """
+    full_text = ""
+    tool_count = 0
 
-### Fase 1: Pesquisa
-- Delegue ao Research Agent com instrucoes claras sobre o que pesquisar
-- Aguarde a conclusao antes de prosseguir
+    with client.beta.sessions.events.stream(session_id) as stream:
+        client.beta.sessions.events.send(
+            session_id,
+            events=[
+                {
+                    "type": "user.message",
+                    "content": [{"type": "text", "text": message}],
+                },
+            ],
+        )
 
-### Fase 2: Escrita
-- Delegue ao Writer Agent pedindo para ler /workspace/research/ e escrever
-- Aguarde a conclusao antes de prosseguir
+        for event in stream:
+            match event.type:
+                case "agent.message":
+                    for block in event.content:
+                        if hasattr(block, "text"):
+                            full_text += block.text
 
-### Fase 3: Adaptacao
-- Delegue ao Adapter Agent pedindo para adaptar /workspace/content/artigo.md
-- Aguarde a conclusao
+                case "agent.tool_use":
+                    tool_count += 1
+                    name = event.name
+                    if name in ("web_search", "web_fetch"):
+                        query = ""
+                        if hasattr(event, "input") and isinstance(event.input, dict):
+                            query = event.input.get("query", event.input.get("url", ""))
+                        print(f"    [{agent_label}] 🔍 {name}: {query[:80]}")
+                    elif name == "write":
+                        path = ""
+                        if hasattr(event, "input") and isinstance(event.input, dict):
+                            path = event.input.get("file_path", "")
+                        print(f"    [{agent_label}] 📝 write: {path}")
+                    elif name == "bash":
+                        cmd = ""
+                        if hasattr(event, "input") and isinstance(event.input, dict):
+                            cmd = event.input.get("command", "")
+                        print(f"    [{agent_label}] ⚙️  bash: {cmd[:60]}")
+                    else:
+                        print(f"    [{agent_label}] 🔧 {name}")
 
-### Fase 4: Entrega
-- Liste todos os arquivos gerados em /workspace/channels/
-- Apresente um resumo ao usuario do que foi produzido
+                case "agent.tool_result":
+                    if event.is_error:
+                        print(f"    [{agent_label}] ❌ ERRO em tool")
 
-## Regras
-- SEMPRE delegue na ordem: Research -> Writer -> Adapter
-- Forneca instrucoes CLARAS e ESPECIFICAS a cada agente
-- NAO tente fazer o trabalho voce mesmo - DELEGUE
-- Ao final, faca um resumo do que foi produzido
-- Portugues brasileiro
-"""
+                case "session.status_idle":
+                    break
+
+                case "span.model_request_end":
+                    if hasattr(event, "model_usage") and event.model_usage:
+                        u = event.model_usage
+                        print(
+                            f"    [{agent_label}] tokens: "
+                            f"in={u.input_tokens} out={u.output_tokens}"
+                        )
+
+    return full_text, tool_count
 
 
-def main():
-    # Research Preview features (multi-agent, memory, outcomes) precisam
-    # de um header beta adicional alem do padrao do SDK.
-    client = Anthropic(
-        default_headers={
-            "anthropic-beta": "managed-agents-2026-04-01,managed-agents-2026-04-01-research-preview",
-        },
+# =============================================================================
+# HELPER: Enviar mensagem e capturar conteudo de arquivos escritos
+# =============================================================================
+
+def run_agent_and_read_output(client, session_id, message, agent_label, output_path):
+    """
+    Roda o agente e depois le o arquivo que ele escreveu no container.
+
+    Retorna o conteudo do arquivo (para passar ao proximo agente).
+    """
+    text, tools = run_agent(client, session_id, message, agent_label)
+    print(f"    [{agent_label}] Concluido! ({tools} tool calls)")
+
+    # Ler o arquivo que o agente escreveu
+    # Enviamos uma segunda mensagem pedindo para o agente ler e retornar o conteudo
+    content, _ = run_agent(
+        client, session_id,
+        f"Leia o arquivo {output_path} e retorne o conteudo completo, sem comentarios adicionais.",
+        agent_label,
     )
 
-    print("=" * 60)
-    print("ETAPA 5: Multi-Agent Orchestrator - Content Factory")
-    print("=" * 60)
+    return content
 
-    # =========================================================================
-    # Rastrear recursos criados para cleanup no finally
-    # =========================================================================
-    # CONCEITO: try/finally garante que recursos sao limpos mesmo em caso
-    # de erro. Sem isso, agents e environments ficam orfaos na sua conta.
-    research_agent = None
-    writer_agent = None
-    adapter_agent = None
-    orchestrator = None
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    client = Anthropic()
+
+    print("=" * 70)
+    print("  CONTENT FACTORY - Multi-Agent Pipeline (Orquestracao Real)")
+    print("=" * 70)
+
+    # Rastrear recursos para cleanup
+    agents = []
     environment = None
+    sessions = []
 
     try:
-        # =====================================================================
-        # PASSO 1: Criar os 3 sub-agentes
-        # =====================================================================
-        # Cada sub-agente e criado independentemente, com seu proprio
-        # system prompt e configuracao de tools.
-        # O Orchestrator os referencia por ID via callable_agents.
-        print("\n[1/5] Criando sub-agentes...")
+        # =================================================================
+        # PASSO 1: Criar os 3 agentes especializados
+        # =================================================================
+        print("\n[SETUP] Criando agentes especializados...")
 
-        # Research Agent - com web tools
         research_agent = client.beta.agents.create(
             name="Research Agent",
             model="claude-sonnet-4-6",
@@ -194,9 +244,9 @@ def main():
                 },
             ],
         )
-        print(f"    Research Agent: {research_agent.id} (v{research_agent.version})")
+        agents.append(research_agent)
+        print(f"  ✓ Research Agent: {research_agent.id}")
 
-        # Writer Agent - sem web, com file ops
         writer_agent = client.beta.agents.create(
             name="Writer Agent",
             model="claude-sonnet-4-6",
@@ -215,9 +265,9 @@ def main():
                 },
             ],
         )
-        print(f"    Writer Agent:   {writer_agent.id} (v{writer_agent.version})")
+        agents.append(writer_agent)
+        print(f"  ✓ Writer Agent:   {writer_agent.id}")
 
-        # Adapter Agent - sem web, com file ops
         adapter_agent = client.beta.agents.create(
             name="Adapter Agent",
             model="claude-sonnet-4-6",
@@ -236,79 +286,13 @@ def main():
                 },
             ],
         )
-        print(f"    Adapter Agent:  {adapter_agent.id} (v{adapter_agent.version})")
+        agents.append(adapter_agent)
+        print(f"  ✓ Adapter Agent:  {adapter_agent.id}")
 
-        # =====================================================================
-        # PASSO 2: Criar o Orchestrator com callable_agents
-        # =====================================================================
-        # CONCEITO NOVO: callable_agents
-        #
-        # O campo callable_agents lista os agentes que este agente pode invocar.
-        # Cada entry precisa de:
-        # - type: "agent"
-        # - id: o agent ID
-        # - version: a versao do agent (para garantir consistencia)
-        #
-        # IMPORTANTE:
-        # - Apenas 1 nivel de delegacao (orquestrador -> sub-agente)
-        # - Sub-agentes NAO podem chamar outros sub-agentes
-        # - Todos compartilham o mesmo container/filesystem
-        # - Cada sub-agente roda em sua propria THREAD com contexto isolado
-        print("\n[2/5] Criando Orchestrator com callable_agents...")
-        # NOTA: callable_agents e Research Preview e pode nao estar tipado no SDK.
-        # Usamos extra_body para enviar parametros que o SDK ainda nao tem tipados.
-        # extra_body e mergeado com o body do request, permitindo acessar
-        # features beta/preview antes do SDK adicionar suporte oficial.
-        orchestrator = client.beta.agents.create(
-            name="Content Director - Orchestrator",
-            model="claude-sonnet-4-6",
-            system=ORCHESTRATOR_SYSTEM_PROMPT,
-            tools=[
-                {
-                    "type": "agent_toolset_20260401",
-                    "default_config": {"enabled": False},
-                    "configs": [
-                        # O orchestrator precisa de bash/read/glob para
-                        # verificar outputs e listar arquivos no final
-                        {"name": "bash", "enabled": True},
-                        {"name": "read", "enabled": True},
-                        {"name": "glob", "enabled": True},
-                    ],
-                },
-            ],
-            # AQUI: declarar os sub-agentes que podem ser chamados.
-            # Usando extra_body porque callable_agents e Research Preview
-            # e pode nao ter tipagem no SDK ainda.
-            extra_body={
-                "callable_agents": [
-                    {
-                        "type": "agent",
-                        "id": research_agent.id,
-                        "version": research_agent.version,
-                    },
-                    {
-                        "type": "agent",
-                        "id": writer_agent.id,
-                        "version": writer_agent.version,
-                    },
-                    {
-                        "type": "agent",
-                        "id": adapter_agent.id,
-                        "version": adapter_agent.version,
-                    },
-                ],
-            },
-        )
-        print(f"    Orchestrator:   {orchestrator.id} (v{orchestrator.version})")
-        # callable_agents vai via extra_body, entao o response pode nao ter o atributo
-        registered = getattr(orchestrator, "callable_agents", None)
-        registered_count = len(registered) if isinstance(registered, list) else 3
-        print(f"    Sub-agentes:    {registered_count} registrados")
-
-        # =====================================================================
-        # PASSO 3: Criar Environment
-        # =====================================================================
-        print("\n[3/5] Criando Environment...")
+        # =================================================================
+        # PASSO 2: Criar environment compartilhado
+        # =================================================================
+        print("\n[SETUP] Criando environment...")
         environment = client.beta.environments.create(
             name="content-factory-env",
             config={
@@ -316,176 +300,193 @@ def main():
                 "networking": {"type": "unrestricted"},
             },
         )
-        print(f"    Environment: {environment.id}")
+        print(f"  ✓ Environment: {environment.id}")
 
-        # =====================================================================
-        # PASSO 4: Criar Session com o Orchestrator
-        # =====================================================================
-        # A session referencia APENAS o orchestrator.
-        # Os callable_agents sao resolvidos automaticamente a partir
-        # da configuracao do orchestrator - nao precisam estar na session.
-        print("\n[4/5] Criando Session...")
-        session = client.beta.sessions.create(
-            agent=orchestrator.id,
+        # =================================================================
+        # PASSO 3: Criar sessions - uma por agente
+        # =================================================================
+        # NOTA: Cada session tem seu proprio container isolado.
+        # Para passar dados entre agentes, enviamos o conteudo via mensagem.
+        print("\n[SETUP] Criando sessions...")
+
+        research_session = client.beta.sessions.create(
+            agent=research_agent.id,
             environment_id=environment.id,
-            title="Content Factory: IA no Marketing",
+            title="Research: IA no Marketing",
         )
-        print(f"    Session: {session.id}")
+        sessions.append(research_session)
+        print(f"  ✓ Research Session: {research_session.id}")
 
-        # =====================================================================
-        # PASSO 5: Enviar briefing e observar orquestracao
-        # =====================================================================
-        # CONCEITO NOVO: Eventos multi-agent
-        #
-        # Alem dos eventos ja conhecidos, o stream agora inclui:
-        # - session.thread_created: novo sub-agente iniciou (com thread_id)
-        # - agent.thread_message_sent: orchestrator enviou msg para sub-agente
-        # - agent.thread_message_received: sub-agente recebeu msg
-        # - session.thread_idle: sub-agente terminou seu trabalho
-        #
-        # O stream da session (primary thread) mostra uma visao RESUMIDA
-        # de todas as threads. Para ver detalhes de cada sub-agente,
-        # voce usaria o stream de thread especifico.
-        briefing = (
-            "Quero produzir conteudo sobre 'O impacto da IA generativa no "
-            "marketing de conteudo em 2025'. Execute o pipeline completo:\n"
-            "1. Pesquise o tema na web\n"
-            "2. Escreva um artigo de blog completo\n"
-            "3. Adapte para LinkedIn, Instagram, Twitter/X e Email\n\n"
-            "Ao final, me mostre um resumo do que foi produzido."
+        writer_session = client.beta.sessions.create(
+            agent=writer_agent.id,
+            environment_id=environment.id,
+            title="Writer: Artigo de Blog",
+        )
+        sessions.append(writer_session)
+        print(f"  ✓ Writer Session:   {writer_session.id}")
+
+        adapter_session = client.beta.sessions.create(
+            agent=adapter_agent.id,
+            environment_id=environment.id,
+            title="Adapter: Multi-Canal",
+        )
+        sessions.append(adapter_session)
+        print(f"  ✓ Adapter Session:  {adapter_session.id}")
+
+        # =================================================================
+        # PIPELINE: Research -> Writer -> Adapter
+        # =================================================================
+        briefing_topic = (
+            "O impacto da IA generativa no marketing de conteudo em 2025"
         )
 
-        print(f"\n[5/5] Enviando briefing para o Content Director...")
-        print(f"    Briefing: {briefing[:60]}...")
-        print("=" * 60)
-        print("STREAM DE EVENTOS (Multi-Agent)")
-        print("=" * 60)
+        # -----------------------------------------------------------------
+        # FASE 1: RESEARCH
+        # -----------------------------------------------------------------
+        print("\n" + "=" * 70)
+        print("  FASE 1: RESEARCH AGENT - Pesquisando na web")
+        print("=" * 70)
 
-        with client.beta.sessions.events.stream(session.id) as stream:
-            client.beta.sessions.events.send(
-                session.id,
-                events=[
-                    {
-                        "type": "user.message",
-                        "content": [{"type": "text", "text": briefing}],
-                    },
-                ],
-            )
+        research_message = (
+            f"Pesquise sobre '{briefing_topic}'. Cubra:\n"
+            "1. Principais ferramentas de IA para criacao de conteudo\n"
+            "2. Como empresas estao usando IA para personalizar conteudo\n"
+            "3. Riscos e limitacoes\n"
+            "4. Tendencias emergentes para 2025-2026\n\n"
+            "Salve o relatorio em /workspace/research/research.md"
+        )
 
-            # Processar stream com foco nos eventos multi-agent
-            threads_seen = {}
-            total_tools = 0
+        research_output = run_agent_and_read_output(
+            client,
+            research_session.id,
+            research_message,
+            "RESEARCH",
+            "/workspace/research/research.md",
+        )
 
-            for event in stream:
-                match event.type:
-                    # --- Eventos Multi-Agent ---
+        print(f"\n  📊 Pesquisa coletada: {len(research_output)} caracteres")
 
-                    case "session.thread_created":
-                        thread_id = getattr(event, "session_thread_id", "?")
-                        agent_name = getattr(event, "agent_name", "Unknown")
-                        threads_seen[thread_id] = agent_name
-                        print(f"\n[THREAD CRIADA] {agent_name}")
-                        print(f"   Thread ID: {thread_id}")
+        # -----------------------------------------------------------------
+        # FASE 2: WRITER
+        # -----------------------------------------------------------------
+        print("\n" + "=" * 70)
+        print("  FASE 2: WRITER AGENT - Escrevendo artigo")
+        print("=" * 70)
 
-                    case "agent.thread_message_sent":
-                        to_thread = getattr(event, "to_thread_id", "?")
-                        target = threads_seen.get(to_thread, "Unknown")
-                        print(f"\n[MSG ENVIADA] Director -> {target}")
+        writer_message = (
+            "Aqui esta a pesquisa completa para voce transformar em artigo:\n\n"
+            "---INICIO DA PESQUISA---\n"
+            f"{research_output}\n"
+            "---FIM DA PESQUISA---\n\n"
+            "Escreva um artigo de blog completo (800-1200 palavras) baseado "
+            "nessa pesquisa. Use os dados e estatisticas encontrados. "
+            "Salve em /workspace/content/artigo.md"
+        )
 
-                    case "agent.thread_message_received":
-                        from_thread = getattr(event, "from_thread_id", "?")
-                        source = threads_seen.get(from_thread, "Unknown")
-                        print(f"\n[MSG RECEBIDA] De: {source}")
+        article_output = run_agent_and_read_output(
+            client,
+            writer_session.id,
+            writer_message,
+            "WRITER",
+            "/workspace/content/artigo.md",
+        )
 
-                    case "session.thread_idle":
-                        thread_id = getattr(event, "session_thread_id", "?")
-                        agent_name = threads_seen.get(thread_id, "Unknown")
-                        print(f"\n[THREAD IDLE] {agent_name} terminou!")
+        print(f"\n  📝 Artigo coletado: {len(article_output)} caracteres")
 
-                    # --- Eventos do Orchestrator ---
+        # -----------------------------------------------------------------
+        # FASE 3: ADAPTER
+        # -----------------------------------------------------------------
+        print("\n" + "=" * 70)
+        print("  FASE 3: ADAPTER AGENT - Adaptando para canais")
+        print("=" * 70)
 
-                    case "agent.message":
-                        for block in event.content:
-                            if hasattr(block, "text"):
-                                print(f"\n[DIRECTOR] {block.text}")
+        adapter_message = (
+            "Aqui esta o artigo para voce adaptar para 4 canais:\n\n"
+            "---INICIO DO ARTIGO---\n"
+            f"{article_output}\n"
+            "---FIM DO ARTIGO---\n\n"
+            "Adapte para os 4 canais conforme suas regras:\n"
+            "1. LinkedIn -> /workspace/channels/linkedin.md\n"
+            "2. Instagram -> /workspace/channels/instagram.md\n"
+            "3. Twitter/X -> /workspace/channels/twitter.md\n"
+            "4. Email -> /workspace/channels/email.md\n\n"
+            "Cada canal deve ter conteudo DIFERENTE e NATIVO da plataforma."
+        )
 
-                    case "agent.tool_use":
-                        total_tools += 1
-                        name = event.name
-                        print(f"\n[TOOL] {name}")
+        adapter_text, adapter_tools = run_agent(
+            client,
+            adapter_session.id,
+            adapter_message,
+            "ADAPTER",
+        )
+        print(f"\n  🎯 Adapter concluido! ({adapter_tools} tool calls)")
 
-                    case "agent.tool_result":
-                        status = "OK" if not event.is_error else "ERRO"
-                        print(f"   -> {status}")
+        # -----------------------------------------------------------------
+        # RESULTADO FINAL
+        # -----------------------------------------------------------------
+        print("\n" + "=" * 70)
+        print("  PIPELINE COMPLETO - RESULTADO FINAL")
+        print("=" * 70)
 
-                    # --- Eventos de Session ---
+        print("""
+  ┌─────────────────────────────────────────────────────┐
+  │                CONTENT FACTORY                       │
+  │                                                      │
+  │  [Briefing]                                          │
+  │      │                                               │
+  │      ▼                                               │
+  │  ┌──────────────┐                                    │
+  │  │ RESEARCH     │ → Pesquisou na web, gerou          │
+  │  │ AGENT        │   relatorio com dados reais        │
+  │  └──────┬───────┘                                    │
+  │         │ (pesquisa passada via mensagem)             │
+  │         ▼                                            │
+  │  ┌──────────────┐                                    │
+  │  │ WRITER       │ → Transformou pesquisa em          │
+  │  │ AGENT        │   artigo de blog completo          │
+  │  └──────┬───────┘                                    │
+  │         │ (artigo passado via mensagem)               │
+  │         ▼                                            │
+  │  ┌──────────────┐    ┌──────────────────────┐        │
+  │  │ ADAPTER      │ →  │ linkedin.md           │        │
+  │  │ AGENT        │ →  │ instagram.md          │        │
+  │  │              │ →  │ twitter.md            │        │
+  │  │              │ →  │ email.md              │        │
+  │  └──────────────┘    └──────────────────────┘        │
+  └─────────────────────────────────────────────────────┘
 
-                    case "session.status_idle":
-                        print("\n" + "=" * 60)
-                        print("PIPELINE COMPLETO!")
-                        print("=" * 60)
-                        print(f"Threads criadas: {len(threads_seen)}")
-                        for tid, name in threads_seen.items():
-                            print(f"  - {name} ({tid[:20]}...)")
-                        print(f"Tool calls (orchestrator): {total_tools}")
-                        break
+  3 agentes especializados, cada um fez SEU trabalho:
+  • Research Agent: pesquisou na web (web_search, web_fetch)
+  • Writer Agent: escreveu o artigo (read, write)
+  • Adapter Agent: adaptou para 4 canais (read, write)
 
-                    case "session.status_running":
-                        pass
-
-                    case "span.model_request_end":
-                        if hasattr(event, "model_usage") and event.model_usage:
-                            usage = event.model_usage
-                            print(
-                                f"[USAGE] In: {usage.input_tokens}, "
-                                f"Out: {usage.output_tokens}"
-                            )
-
-        # =====================================================================
-        # BONUS: Listar threads da session
-        # =====================================================================
-        print("\n" + "=" * 60)
-        print("THREADS DA SESSION")
-        print("=" * 60)
-        try:
-            for thread in client.beta.sessions.threads.list(session.id):
-                print(f"  [{thread.agent_name}] Status: {thread.status}")
-        except Exception as e:
-            print(f"  Erro ao listar threads: {e}")
+  O codigo Python orquestrou o pipeline passando o output
+  de cada agente como input para o proximo.
+""")
 
     finally:
-        # =====================================================================
-        # CLEANUP - SEMPRE executa, mesmo em caso de erro
-        # =====================================================================
-        # CONCEITO: try/finally garante que recursos sao limpos.
-        # Sem isso, agents e environments orfaos ficam na conta.
-        print("\n" + "=" * 60)
-        print("CLEANUP")
-        print("=" * 60)
+        # =================================================================
+        # CLEANUP
+        # =================================================================
+        print("=" * 70)
+        print("  CLEANUP")
+        print("=" * 70)
 
-        for agent_obj in [
-            research_agent,
-            writer_agent,
-            adapter_agent,
-            orchestrator,
-        ]:
-            if agent_obj:
-                try:
-                    client.beta.agents.archive(agent_obj.id)
-                    print(f"  Agent {agent_obj.name} arquivado")
-                except Exception:
-                    pass
+        for agent_obj in agents:
+            try:
+                client.beta.agents.archive(agent_obj.id)
+                print(f"  ✓ Agent {agent_obj.name} arquivado")
+            except Exception:
+                pass
 
         if environment:
             try:
                 client.beta.environments.delete(environment.id)
-                print(f"  Environment deletado")
+                print(f"  ✓ Environment deletado")
             except Exception:
                 pass
 
-        print("--- CLEANUP COMPLETO ---")
-
-    print("\nEtapa 5 concluida com sucesso!")
+        print("  --- CLEANUP COMPLETO ---")
 
 
 if __name__ == "__main__":
